@@ -2,11 +2,14 @@
  * Browser half of the Magpie quota bundle.
  *
  * One compact reading in `conversation.composer.dock` (same row as the shipped
- * context meter): a battery glyph and the lowest remaining account percentage.
- * Clicking it opens a native-styled call-out panel (menu surface, elevation,
- * radius, type scale, dismiss + Escape behavior copied from the shipped
- * ContextMeter) that lists, per account, exactly two things: the total-quota
- * percentage and one model usage-limit percentage (with 已用/上限 amounts).
+ * context meter): a battery glyph plus the share of all-account quota that is
+ * still usable (Σ remaining / Σ limit over every non-expired account, weighted
+ * by each account's own limit — not the lowest single account, and not the
+ * current session's account). Clicking it opens a native-styled call-out panel
+ * (menu surface, elevation, radius, type scale, dismiss + Escape behavior
+ * copied from the shipped ContextMeter) that lists, per account, exactly two
+ * things: the total-quota percentage and one model usage-limit percentage
+ * (with 已用/上限 amounts).
  *
  * Architecture: a single module-level store owns the data. Every mounted
  * composer subscribes to it through `useSyncExternalStore`; fetches are
@@ -35,6 +38,8 @@ window.__ModuleLoader__.load({
     const NS = 'magpieQuota';
     /** Same-origin Host route registered by the Host half. */
     const QUOTA_ROUTE = '/__local/magpie-quota';
+    /** Stable id linking the trigger to its panel via aria-controls. */
+    const PANEL_ID = 'dsh-magpie-quota-panel';
     /** Background refresh cadence while the page is visible. */
     const POLL_MS = 60000;
 
@@ -45,7 +50,7 @@ window.__ModuleLoader__.load({
       zh: {
         title: 'magpie 额度',
         totalQuota: '总额度',
-        triggerAria: 'magpie 额度：最低剩余 {pct}',
+        triggerAria: 'magpie 额度：全部账号中可用 {pct}',
         triggerAriaUnknown: 'magpie 额度',
         staleSuffix: '（数据可能已过期）',
         updated: '更新于 {time}',
@@ -62,11 +67,12 @@ window.__ModuleLoader__.load({
         errBadJson: 'magpie 网关返回了无法解析的数据',
         errBadFormat: '额度数据格式无效',
         errNetwork: '读取额度失败',
+        failedChip: '额度读取失败',
       },
       en: {
         title: 'Magpie quota',
         totalQuota: 'Total quota',
-        triggerAria: 'Magpie quota: lowest {pct} remaining',
+        triggerAria: 'Magpie quota: {pct} of all accounts usable',
         triggerAriaUnknown: 'Magpie quota',
         staleSuffix: ' (data may be stale)',
         updated: 'Updated {time}',
@@ -83,6 +89,7 @@ window.__ModuleLoader__.load({
         errBadJson: 'The magpie gateway returned unreadable data',
         errBadFormat: 'The quota data format is invalid',
         errNetwork: 'Could not read the quota',
+        failedChip: 'Quota unavailable',
       },
     };
 
@@ -178,6 +185,18 @@ window.__ModuleLoader__.load({
       return used === undefined ? 0 : Math.max(0, Math.min(100, used));
     }
 
+    /**
+     * Percentage remaining for a window's bar, so the bar and the adjacent
+     * number always read in the same direction (a nearly empty bar next to a
+     * small percentage). Mirrors `usedPercentOf` with the opposite fallback.
+     */
+    function remainingPercentOf(window) {
+      if (typeof window.remainingPct === 'number') {
+        return Math.max(0, Math.min(100, window.remainingPct));
+      }
+      return 100 - usedPercentOf(window);
+    }
+
     /** The gateway's amount/limit string, with a numeric fallback. */
     function figuresOf(window) {
       if (window.display !== '') return window.display;
@@ -213,16 +232,56 @@ window.__ModuleLoader__.load({
       return { accounts: list.filter(isObject).map(toAccount) };
     }
 
-    /** Lowest remaining percentage across usable accounts, or null. */
-    function summaryPct(data) {
+    /**
+     * Remaining amount of a window, derived from amount/limit or from the
+     * remaining percentage. Undefined when the window carries no usable figure.
+     */
+    function remainingAmountOf(window) {
+      if (window === null || typeof window !== 'object') return undefined;
+      const limit = num(window.limit);
+      if (limit === undefined || limit <= 0) return undefined;
+      const amount = num(window.amount);
+      if (amount !== undefined) return Math.max(0, Math.min(limit, limit - amount));
+      const pct = clampPct(window.remainingPct);
+      if (pct !== undefined) return limit * pct / 100;
+      return undefined;
+    }
+
+    /**
+     * Usable share of the whole account pool, as a percentage, or null.
+     *
+     * Weighted across every non-expired account — never the lowest single
+     * account, and never just the current session's account: each account's
+     * own total-quota limit is the weight, and its remaining amount is the
+     * contribution, so Σ remaining / Σ limit answers "how much of all the
+     * quota I have is still spendable". Accounts without a numeric limit fall
+     * back to an unweighted mean of their remaining percentages, used only
+     * when no account reports a limit at all.
+     */
+    function usableSharePct(data) {
       if (!data || data.accounts.length === 0) return null;
-      let best = null;
+      let limitSum = 0;
+      let remainSum = 0;
+      let pctSum = 0;
+      let pctCount = 0;
       for (const account of data.accounts) {
-        if (!account.expired && typeof account.remaining === 'number') {
-          best = best === null ? account.remaining : Math.min(best, account.remaining);
+        if (account.expired) continue;
+        const window = account.total;
+        const remaining = remainingAmountOf(window);
+        const limit = window === null ? undefined : num(window.limit);
+        if (remaining !== undefined && limit !== undefined && limit > 0) {
+          limitSum += limit;
+          remainSum += remaining;
+          continue;
+        }
+        if (typeof account.remaining === 'number') {
+          pctSum += account.remaining;
+          pctCount += 1;
         }
       }
-      return best;
+      if (limitSum > 0) return Math.max(0, Math.min(100, remainSum / limitSum * 100));
+      if (pctCount > 0) return Math.max(0, Math.min(100, pctSum / pctCount));
+      return null;
     }
 
     /** Localized error sentence for a state.error descriptor. */
@@ -386,6 +445,9 @@ window.__ModuleLoader__.load({
       '.dsh-mq-error{display:flex;align-items:flex-start;gap:8px;padding:6px 7px;margin-bottom:6px;border-radius:var(--dsw-radius-md,8px);background:var(--dsw-alias-interactive-bg-hover-danger,rgba(214,69,69,.12));color:var(--dsw-alias-state-error-primary,#d64545);font-size:11px;line-height:16px;}',
       '.dsh-mq-errtext{flex:1;min-width:0;overflow-wrap:anywhere;}',
       '.dsh-mq-retry{flex:none;padding:0;border:none;background:transparent;color:inherit;font:inherit;font-weight:600;cursor:pointer;}',
+      '.dsh-mq-retry:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4f7bd8));outline-offset:2px;border-radius:var(--dsw-radius-sm,4px);}',
+      // A failed read has no reading; say so instead of showing a bare dash.
+      '.dsh-mq-trigger[data-failed="1"]{color:var(--dsw-alias-state-error-primary,#d64545);}',
     ].join('\n');
 
     /** Battery glyph: outline cells; fill width = remaining share, colored by level. */
@@ -409,7 +471,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dsh-mq-itemval', style: { color: tint } }, remaining === undefined ? '—' : `${remaining}%`),
         ),
         h('div', { className: 'dsh-mq-bar' },
-          h('div', { className: 'dsh-mq-fill', style: { width: `${usedPercentOf(window)}%`, background: tint } }),
+          h('div', { className: 'dsh-mq-fill', style: { width: `${remainingPercentOf(window)}%`, background: tint } }),
         ),
       );
     }
@@ -448,11 +510,16 @@ window.__ModuleLoader__.load({
       const frameRef = React.useRef(0);
 
       const data = state.data;
-      const pct = summaryPct(data);
+      const pct = usableSharePct(data);
       const rounded = typeof pct === 'number' ? Math.round(pct) : null;
       const tint = LEVEL_COLOR[levelOf(rounded === null ? undefined : rounded)];
       const stale = state.error !== null && data !== null;
-      const baseAria = rounded === null ? t('triggerAriaUnknown') : fill(t('triggerAria'), { pct: `${rounded}%` });
+      // No reading yet and no failure: stay out of the dock, like the shipped
+      // context meter, instead of reserving space for a placeholder.
+      const failed = state.error !== null && data === null;
+      const baseAria = failed
+        ? describeError(t, state.error)
+        : rounded === null ? t('triggerAriaUnknown') : fill(t('triggerAria'), { pct: `${rounded}%` });
 
       function reposition() {
         const el = btnRef.current;
@@ -477,21 +544,30 @@ window.__ModuleLoader__.load({
         frameRef.current = requestAnimationFrame(() => { frameRef.current = 0; reposition(); });
       }
 
-      // Anchor + focus + scroll tracking while open.
+      // Anchor + focus + scroll tracking while open. The composer grows while
+      // the user types or adds attachments without any scroll or window resize,
+      // so the trigger is also observed directly.
       React.useLayoutEffect(() => {
         if (!open) return undefined;
         reposition();
         panelRef.current?.focus?.();
         window.addEventListener('resize', scheduleReposition);
         window.addEventListener('scroll', scheduleReposition, { capture: true, passive: true });
+        let observer = null;
+        if (typeof ResizeObserver === 'function' && btnRef.current !== null) {
+          observer = new ResizeObserver(scheduleReposition);
+          observer.observe(btnRef.current);
+        }
         return () => {
           window.removeEventListener('resize', scheduleReposition);
           window.removeEventListener('scroll', scheduleReposition, { capture: true, passive: true });
+          observer?.disconnect();
           if (frameRef.current !== 0) { cancelAnimationFrame(frameRef.current); frameRef.current = 0; }
         };
       }, [open]);
 
-      // Refresh on open; dismiss on outside pointer / Escape.
+      // Refresh on open; dismiss on outside pointer / Escape. Focus returns to
+      // the trigger so keyboard users are not dropped on the document body.
       React.useEffect(() => {
         if (!open) return undefined;
         store.refresh();
@@ -506,13 +582,16 @@ window.__ModuleLoader__.load({
         return () => {
           document.removeEventListener('pointerdown', onPointerDown, true);
           document.removeEventListener('keydown', onKeyDown);
+          btnRef.current?.focus?.();
         };
       }, [open]);
 
       const body = [];
       if (state.error !== null) {
-        body.push(h('div', { key: 'error', className: 'dsh-mq-error', role: 'alert' },
-          h('span', { className: 'dsh-mq-errtext' }, describeError(t, state.error)),
+        // The message is the live region; the Retry button sits beside it so
+        // the alert does not wrap an interactive control.
+        body.push(h('div', { key: 'error', className: 'dsh-mq-error' },
+          h('span', { className: 'dsh-mq-errtext', role: 'alert' }, describeError(t, state.error)),
           h('button', { type: 'button', className: 'dsh-mq-retry', onClick: () => store.refresh() }, t('retry')),
         ));
       }
@@ -532,7 +611,7 @@ window.__ModuleLoader__.load({
         : { left: `${pos.left}px`, bottom: `${pos.bottom}px`, width: `${pos.width}px`, maxHeight: `${pos.maxHeight}px` });
 
       const panel = h('div', {
-        ref: panelRef, className: 'dsh-mq-panel', role: 'dialog', tabIndex: -1, 'aria-label': t('title'), style: panelStyle,
+        ref: panelRef, id: PANEL_ID, className: 'dsh-mq-panel', role: 'dialog', tabIndex: -1, 'aria-label': t('title'), style: panelStyle,
       },
         h('div', { className: 'dsh-mq-head' },
           h('span', { className: 'dsh-mq-title' }, t('title')),
@@ -552,11 +631,16 @@ window.__ModuleLoader__.load({
             ref: btnRef, type: 'button', className: 'dsh-mq-trigger',
             title: stale ? baseAria + t('staleSuffix') : baseAria,
             'aria-label': stale ? baseAria + t('staleSuffix') : baseAria,
-            'aria-haspopup': 'dialog', 'aria-expanded': open, 'data-stale': stale ? '1' : undefined,
+            'aria-haspopup': 'dialog', 'aria-expanded': open,
+            'aria-controls': open ? PANEL_ID : undefined,
+            'data-stale': stale ? '1' : undefined,
+            // A failed read has no reading to show; mark it so the chip can
+            // signal the problem instead of showing a meaningless "—".
+            'data-failed': failed ? '1' : undefined,
             onClick: () => setOpen(value => !value),
           },
-            h(BatteryGlyph, { pct: typeof pct === 'number' ? pct : 0, color: tint }),
-            h('span', { className: 'dsh-mq-pct' }, rounded === null ? '—' : `${rounded}%`),
+            h(BatteryGlyph, { pct: rounded === null ? 0 : rounded, color: tint }),
+            h('span', { className: 'dsh-mq-pct' }, failed ? t('failedChip') : rounded === null ? '—' : `${rounded}%`),
           ),
         ),
         open ? (createPortal ? createPortal(panel, document.body) : panel) : null,
@@ -592,7 +676,18 @@ window.__ModuleLoader__.load({
         }, QuotaMeter));
       },
       /** Pure helpers exposed for offline logic tests; the Loader ignores extra exports. */
-      _internals: { fill, normalize, summaryPct, levelOf, describeError, pickTotal, pickModel, usedPercentOf, figuresOf },
+      _internals: {
+        fill,
+        normalize,
+        usableSharePct,
+        remainingAmountOf,
+        levelOf,
+        describeError,
+        pickTotal,
+        pickModel,
+        usedPercentOf,
+        figuresOf,
+      },
     };
   },
 });
