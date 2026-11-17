@@ -1,0 +1,31 @@
+{
+  "name": "@local/magpie-quota",
+  "version": "1.1.1",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Shows magpie's account quota below the composer and opens a native-style popover with each account's usage windows.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "README.md",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  }
+}

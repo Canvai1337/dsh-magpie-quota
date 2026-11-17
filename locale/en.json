@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Magpie quota",
+    "description": "Shows magpie's account quota in the composer's status row and opens a call-out panel with each account and its usage windows. Click the reading to open the panel; use the refresh button to re-read. Figures are read from the local magpie gateway through the Host; nothing is sent elsewhere. Turning the plugin off removes the reading and its panel.",
+    "detail": "docs/DETAIL.md"
+  }
+}
